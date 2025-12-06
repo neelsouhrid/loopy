@@ -5,6 +5,7 @@ import RPi.GPIO as GPIO
 import os
 import json
 from pathlib import Path
+from datetime import datetime
 
 # --- CONFIGURATION ---
 BTN_MODE = 5
@@ -30,6 +31,9 @@ MODE_REC = "REC"
 MODE_PLAY = "PLAY"
 
 tracks = [[] for _ in range(10)]
+track_durations = [0.0 for _ in range(10)]  # Store actual recorded duration
+track_programs = [0 for _ in range(10)]  # Store program/tone for each track
+track_channels = [0 for _ in range(10)]  # Store MIDI channel for each track
 current_track_idx = 0
 system_mode = MODE_REC
 
@@ -39,7 +43,7 @@ is_recording = False
 start_time = 0.0
 pause_start_time = 0.0
 total_pause_duration = 0.0
-max_track_duration = 0.0  # For looping sync
+recording_start_time = 0.0  # Track when recording actually started
 
 midi_in = None
 midi_out = None
@@ -73,6 +77,14 @@ def flash_led(pin, duration=0.2):
     set_led(pin, True)
     time.sleep(duration)
     set_led(pin, False)
+
+def get_track_duration(track_idx):
+    """Get the actual recorded duration of a track"""
+    return track_durations[track_idx]
+
+def get_max_track_duration():
+    """Get the duration of the longest track"""
+    return max(track_durations)
 
 def update_ui():
     """Update all LEDs based on current state"""
@@ -121,7 +133,10 @@ def midi_panic():
         try:
             for ch in range(16):
                 midi_out.send(mido.Message('control_change', channel=ch, control=123, value=0))
-                midi_out.send(mido.Message('control_change', channel=ch, control=121, value=0))
+                midi_out.send(mido.Message('control_change', channel=ch, control=120, value=0))
+                # Send note offs for all notes
+                for note in range(128):
+                    midi_out.send(mido.Message('note_off', channel=ch, note=note, velocity=0))
         except Exception as e:
             print(f"MIDI panic error: {e}")
 
@@ -145,21 +160,35 @@ def autosave_tracks():
     try:
         data = {
             'tracks': [],
-            'max_duration': max_track_duration
+            'durations': track_durations,
+            'programs': track_programs,  # Save tone settings
+            'channels': track_channels   # Save channel settings
         }
         
         for track in tracks:
             track_data = []
             for timestamp, msg in track:
-                track_data.append({
+                msg_dict = {
                     'time': timestamp,
                     'type': msg.type,
-                    'note': getattr(msg, 'note', None),
-                    'velocity': getattr(msg, 'velocity', None),
-                    'control': getattr(msg, 'control', None),
-                    'value': getattr(msg, 'value', None),
                     'channel': getattr(msg, 'channel', 0)
-                })
+                }
+                
+                # Add message-specific attributes
+                if hasattr(msg, 'note'):
+                    msg_dict['note'] = msg.note
+                if hasattr(msg, 'velocity'):
+                    msg_dict['velocity'] = msg.velocity
+                if hasattr(msg, 'control'):
+                    msg_dict['control'] = msg.control
+                if hasattr(msg, 'value'):
+                    msg_dict['value'] = msg.value
+                if hasattr(msg, 'program'):
+                    msg_dict['program'] = msg.program
+                if hasattr(msg, 'pitch'):
+                    msg_dict['pitch'] = msg.pitch
+                
+                track_data.append(msg_dict)
             data['tracks'].append(track_data)
         
         with open(AUTOSAVE_DIR / 'session.json', 'w') as f:
@@ -171,7 +200,7 @@ def autosave_tracks():
 
 def autoload_tracks():
     """Load last session from autosave"""
-    global tracks, max_track_duration
+    global tracks, track_durations, track_programs, track_channels
     
     try:
         save_file = AUTOSAVE_DIR / 'session.json'
@@ -182,46 +211,80 @@ def autoload_tracks():
         with open(save_file, 'r') as f:
             data = json.load(f)
         
-        max_track_duration = data.get('max_duration', 0.0)
+        # Initialize arrays
+        has_saved_durations = 'durations' in data
+        if has_saved_durations:
+            track_durations = list(data['durations'])  # Make a copy
+        else:
+            track_durations = [0.0] * 10
+        
+        # Load program/channel data if available
+        if 'programs' in data:
+            track_programs[:] = data['programs']
+        if 'channels' in data:
+            track_channels[:] = data['channels']
         
         for i, track_data in enumerate(data['tracks']):
             tracks[i] = []
             for event in track_data:
-                # Reconstruct MIDI message
-                if event['type'] == 'note_on':
+                # Reconstruct MIDI message based on type
+                msg_type = event['type']
+                channel = event.get('channel', 0)
+                
+                if msg_type == 'note_on':
                     msg = mido.Message('note_on', 
                                       note=event['note'], 
                                       velocity=event['velocity'],
-                                      channel=event['channel'])
-                elif event['type'] == 'note_off':
+                                      channel=channel)
+                elif msg_type == 'note_off':
                     msg = mido.Message('note_off',
                                       note=event['note'],
-                                      velocity=event['velocity'],
-                                      channel=event['channel'])
-                elif event['type'] == 'control_change':
+                                      velocity=event.get('velocity', 0),
+                                      channel=channel)
+                elif msg_type == 'control_change':
                     msg = mido.Message('control_change',
                                       control=event['control'],
                                       value=event['value'],
-                                      channel=event['channel'])
+                                      channel=channel)
+                elif msg_type == 'program_change':
+                    msg = mido.Message('program_change',
+                                      program=event['program'],
+                                      channel=channel)
+                elif msg_type == 'pitchwheel':
+                    msg = mido.Message('pitchwheel',
+                                      pitch=event['pitch'],
+                                      channel=channel)
                 else:
                     continue
                 
                 tracks[i].append((event['time'], msg))
+            
+            # CRITICAL FIX: If durations weren't saved, calculate from last event
+            if not has_saved_durations and len(tracks[i]) > 0:
+                track_durations[i] = tracks[i][-1][0]
         
         print("✓ Loaded autosave")
+        # Show what was loaded
+        for i in range(10):
+            if len(tracks[i]) > 0:
+                print(f"  Track {i+1}: {len(tracks[i])} events, {track_durations[i]:.2f}s")
     except Exception as e:
         print(f"Autoload error: {e}")
 
-def export_midi_merged(filename="merged_output.mid"):
-    """Export all tracks merged into one MIDI file"""
+def export_midi_merged(filename=None):
+    """Export all tracks merged into one MIDI file with timestamp"""
     try:
-        mid = mido.MidiFile()
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"merged_{timestamp}.mid"
+        
+        mid = mido.MidiFile(ticks_per_beat=480)
         track = mido.MidiTrack()
         mid.tracks.append(track)
         
         # Collect all events
         all_events = []
-        for track_data in tracks:
+        for track_idx, track_data in enumerate(tracks):
             for timestamp, msg in track_data:
                 all_events.append((timestamp, msg))
         
@@ -231,7 +294,8 @@ def export_midi_merged(filename="merged_output.mid"):
         # Convert to MIDI with delta times
         prev_time = 0
         for timestamp, msg in all_events:
-            delta_ticks = int((timestamp - prev_time) * 480)  # 480 ticks per beat
+            delta_time = timestamp - prev_time
+            delta_ticks = int(delta_time * 480)
             msg_copy = msg.copy(time=delta_ticks)
             track.append(msg_copy)
             prev_time = timestamp
@@ -245,25 +309,28 @@ def export_midi_merged(filename="merged_output.mid"):
         return None
 
 def export_midi_separate():
-    """Export each track as separate MIDI file"""
+    """Export each track as separate MIDI file with timestamp"""
     try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         exported = []
+        
         for i, track_data in enumerate(tracks):
             if len(track_data) == 0:
                 continue
             
-            mid = mido.MidiFile()
+            mid = mido.MidiFile(ticks_per_beat=480)
             track = mido.MidiTrack()
             mid.tracks.append(track)
             
             prev_time = 0
-            for timestamp, msg in track_data:
-                delta_ticks = int((timestamp - prev_time) * 480)
+            for ts, msg in track_data:
+                delta_time = ts - prev_time
+                delta_ticks = int(delta_time * 480)
                 msg_copy = msg.copy(time=delta_ticks)
                 track.append(msg_copy)
-                prev_time = timestamp
+                prev_time = ts
             
-            filename = f"track_{i+1}.mid"
+            filename = f"track_{i+1}_{timestamp}.mid"
             filepath = MIDI_EXPORT_DIR / filename
             mid.save(str(filepath))
             exported.append(str(filepath))
@@ -275,49 +342,93 @@ def export_midi_separate():
         return []
 
 def import_midi_to_track(filepath, track_idx):
-    """Import MIDI file into specified track"""
-    global max_track_duration
-    
+    """Import MIDI file into specified track - FIXED timing accumulation"""
     try:
         mid = mido.MidiFile(filepath)
         tracks[track_idx] = []
         
-        current_time = 0.0
-        for msg in mid:
-            if not msg.is_meta:
-                current_time += msg.time / 480.0  # Convert ticks to seconds
-                tracks[track_idx].append((current_time, msg))
+        tempo = 500000
+        ticks_per_beat = mid.ticks_per_beat
         
-        # Update max duration
+        # Collect all events from all tracks with absolute timing
+        all_events = []
+        
+        for midi_track in mid.tracks:
+            track_time = 0.0
+            
+            for msg in midi_track:
+                # Convert delta time to seconds
+                tick_time = msg.time
+                seconds_per_tick = (tempo / 1000000.0) / ticks_per_beat
+                delta_seconds = tick_time * seconds_per_tick
+                track_time += delta_seconds  # Accumulate time
+                
+                # Update tempo if needed
+                if msg.type == 'set_tempo':
+                    tempo = msg.tempo
+                    seconds_per_tick = (tempo / 1000000.0) / ticks_per_beat
+                
+                # Store ALL non-meta messages with absolute time
+                if not msg.is_meta:
+                    all_events.append((track_time, msg))
+                    
+                    # Track program changes for tone
+                    if msg.type == 'program_change':
+                        track_programs[track_idx] = msg.program
+                        track_channels[track_idx] = msg.channel
+                        print(f"Detected tone: Program {msg.program} on channel {msg.channel}")
+        
+        # Sort by time and store
+        all_events.sort(key=lambda x: x[0])
+        tracks[track_idx] = all_events
+        
+        # Set duration to last event time (or a bit after for note releases)
         if len(tracks[track_idx]) > 0:
-            track_duration = tracks[track_idx][-1][0]
-            max_track_duration = max(max_track_duration, track_duration)
+            track_durations[track_idx] = tracks[track_idx][-1][0] + 0.5  # Add buffer for final notes
         
-        print(f"✓ Imported to Track {track_idx + 1}")
+        print(f"✓ Imported to Track {track_idx + 1} ({len(tracks[track_idx])} events, {track_durations[track_idx]:.2f}s)")
         autosave_tracks()
     except Exception as e:
         print(f"Import error: {e}")
 
-# --- SEQUENCER ---
+# --- SEQUENCER - PROPERLY FIXED LOOPING ---
 def sequencer_thread():
-    global is_running, is_paused, total_pause_duration, pause_start_time, max_track_duration
+    """FIXED: Each track loops independently at its own duration"""
+    global is_running, is_paused, total_pause_duration, pause_start_time
     
     print("Sequencer Started")
     
-    # Build playlist
-    playlist = []
+    # Get loop duration (longest track OR recording time limit)
+    loop_duration = get_max_track_duration()
+    
+    if loop_duration == 0:
+        loop_duration = 999999  # No tracks yet, allow infinite recording
+    
+    print(f"Master loop duration: {loop_duration:.2f}s")
+    
+    # Send initial program changes to set tones for each track
+    for i in range(10):
+        if len(tracks[i]) > 0 and track_programs[i] > 0:
+            try:
+                prog_msg = mido.Message('program_change', program=track_programs[i], channel=track_channels[i])
+                midi_out.send(prog_msg)
+                print(f"Set Track {i+1} tone: Program {track_programs[i]} on channel {track_channels[i]}")
+            except Exception as e:
+                print(f"Error setting tone: {e}")
+    
+    # Build playlists for each track
+    track_playlists = []
     for i, track in enumerate(tracks):
+        # In REC mode, skip the track we're recording on
         if system_mode == MODE_REC and i == current_track_idx:
-            continue
-        for event in track:
-            playlist.append(event)
+            track_playlists.append([])
+        else:
+            track_playlists.append(list(track))
     
-    playlist.sort(key=lambda x: x[0])
+    # Track which event we're on for each track
+    event_indices = [0] * 10
+    last_loop_times = [0.0] * 10  # Track when each track last looped
     
-    # Calculate loop duration
-    loop_duration = max_track_duration if max_track_duration > 0 else 999999
-    
-    event_idx = 0
     base_time = start_time
     local_pause_duration = 0
     local_pause_start = 0
@@ -337,55 +448,75 @@ def sequencer_thread():
         now = time.perf_counter()
         song_time = now - base_time - local_pause_duration
         
-        # Loop if in PLAY mode
-        if system_mode == MODE_PLAY and song_time >= loop_duration:
-            # Reset for loop
-            song_time = song_time % loop_duration
-            base_time = now - song_time - local_pause_duration
-            event_idx = 0
-        
-        # Trigger events
-        while event_idx < len(playlist):
-            evt_time, msg = playlist[event_idx]
+        # Check each track independently with its OWN duration
+        for track_idx, playlist in enumerate(track_playlists):
+            if len(playlist) == 0:
+                continue
             
-            # Adjust for looping
-            target_time = evt_time
-            if system_mode == MODE_PLAY and loop_duration < 999999:
-                target_time = evt_time % loop_duration
+            # Get THIS track's actual duration
+            track_duration = track_durations[track_idx]
             
-            if song_time >= target_time:
-                try:
-                    midi_out.send(msg)
-                except Exception as e:
-                    print(f"MIDI send error: {e}")
-                event_idx += 1
-            else:
-                break
+            if track_duration == 0:
+                continue
+            
+            # Calculate position within THIS track's loop
+            track_position = song_time % track_duration
+            
+            # Check if we've looped (track_position went back to start)
+            if track_position < last_loop_times[track_idx]:
+                # We looped! Reset event index
+                event_indices[track_idx] = 0
+                print(f"Track {track_idx + 1} looped at {song_time:.2f}s")
+            
+            last_loop_times[track_idx] = track_position
+            
+            # Play all events that should trigger now
+            while event_indices[track_idx] < len(playlist):
+                evt_time, msg = playlist[event_indices[track_idx]]
+                
+                if evt_time <= track_position:
+                    try:
+                        midi_out.send(msg)
+                        # Debug program changes
+                        if msg.type == 'program_change':
+                            print(f"Sent program change: {msg.program} on channel {msg.channel}")
+                    except Exception as e:
+                        print(f"MIDI send error: {e}")
+                    event_indices[track_idx] += 1
+                else:
+                    break
         
         time.sleep(0.001)
     
     total_pause_duration = local_pause_duration
+    midi_panic()
     print("Sequencer Stopped")
 
 def midi_recorder():
-    global max_track_duration
+    """Record MIDI input - ALL message types including program changes"""
+    global recording_start_time
     
     print(f"Listening on {midi_in.name}...")
     
     for msg in midi_in:
+        # Only record when actively recording (no passthrough to avoid double notes)
         if is_running and not is_paused and system_mode == MODE_REC and is_recording:
             now = time.perf_counter()
             rec_time = now - start_time - total_pause_duration
             
             if rec_time >= 0:
                 tracks[current_track_idx].append((rec_time, msg))
-                # Update max duration
-                max_track_duration = max(max_track_duration, rec_time)
+                
+                # Track program changes for tone preservation
+                if msg.type == 'program_change':
+                    track_programs[current_track_idx] = msg.program
+                    track_channels[current_track_idx] = msg.channel
+                    print(f"✓ Recorded program change: Program #{msg.program} (Tone) on channel {msg.channel}")
 
 # --- BUTTON LOGIC ---
 def handle_buttons():
     global system_mode, current_track_idx, is_running, is_paused, is_recording
-    global start_time, total_pause_duration, tracks, max_track_duration
+    global start_time, total_pause_duration, tracks, track_durations, recording_start_time
     
     last_states = {
         BTN_MODE: 1,
@@ -415,6 +546,15 @@ def handle_buttons():
             # START/STOP
             if s_action == 0 and last_states[BTN_ACTION] == 1:
                 if is_running:
+                    # STOPPING
+                    stop_time = time.perf_counter()
+                    
+                    # If we were recording, set the actual duration
+                    if is_recording:
+                        actual_duration = stop_time - start_time - total_pause_duration
+                        track_durations[current_track_idx] = actual_duration
+                        print(f"Recorded {actual_duration:.2f}s on Track {current_track_idx + 1}")
+                    
                     is_running = False
                     is_paused = False
                     is_recording = False
@@ -425,9 +565,12 @@ def handle_buttons():
                     if system_mode == MODE_REC:
                         autosave_tracks()
                 else:
+                    # STARTING
                     if system_mode == MODE_REC:
                         tracks[current_track_idx] = []
+                        track_durations[current_track_idx] = 0.0
                         is_recording = True
+                        recording_start_time = time.perf_counter()
                         print(f"Recording Track {current_track_idx + 1}...")
                     else:
                         print("Playing...")
@@ -461,6 +604,7 @@ def handle_buttons():
                     update_ui()
                 elif system_mode == MODE_PLAY:
                     tracks[current_track_idx] = []
+                    track_durations[current_track_idx] = 0.0
                     flash_led(LED_CLEAR)
                     print(f"Track {current_track_idx + 1} Cleared!")
                     autosave_tracks()
@@ -471,8 +615,12 @@ def handle_buttons():
                 is_paused = False
                 is_recording = False
                 midi_panic()
-                tracks = [[] for _ in range(10)]
-                max_track_duration = 0.0
+                # CRITICAL FIX: Properly clear all track data with global scope
+                for i in range(10):
+                    tracks[i] = []
+                    track_durations[i] = 0.0
+                    track_programs[i] = 0
+                    track_channels[i] = 0
                 flash_led(LED_DELETE_ALL, duration=1.0)
                 print("--- ALL TRACKS DELETED ---")
                 autosave_tracks()
@@ -515,7 +663,7 @@ def cli_thread():
                     print("Invalid choice")
             
             elif cmd.startswith('load'):
-                parts = cmd.split()
+                parts = cmd.split(maxsplit=2)
                 if len(parts) == 3:
                     track_num = int(parts[1]) - 1
                     filepath = parts[2]
@@ -530,11 +678,12 @@ def cli_thread():
                 print("\n=== Track Status ===")
                 for i, track in enumerate(tracks):
                     if len(track) > 0:
-                        duration = track[-1][0]
+                        duration = track_durations[i]
                         print(f"Track {i+1}: {len(track)} events, {duration:.2f}s")
                     else:
                         print(f"Track {i+1}: Empty")
-                print(f"Max duration: {max_track_duration:.2f}s")
+                max_dur = get_max_track_duration()
+                print(f"Longest track: {max_dur:.2f}s")
                 print("====================\n")
             
         except Exception as e:
