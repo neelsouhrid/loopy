@@ -5,9 +5,11 @@ A hardware-based 10-track MIDI looper pedal built with Raspberry Pi 3B+ and desi
 ## ✨ Features
 
 - **10 Independent Tracks** - Layer multiple MIDI recordings
+- **Super Looper Mode** - Perfect synchronization with fixed loop duration
 - **Backing Track Recording** - Hear previous tracks while recording new ones
 - **Auto-Looping Playback** - Tracks loop seamlessly based on longest recording
 - **Full MIDI Capture** - Records velocity, sustain pedal, and all MIDI CC data
+- **Multitrack Tone Isolation** - Each track can use a different instrument/tone
 - **Persistent Storage** - Auto-saves session, survives power cycles
 - **MIDI Export** - Export as merged or separate MIDI files
 - **MIDI Import** - Load existing MIDI files into tracks
@@ -163,14 +165,33 @@ Connect all LED cathodes and button grounds to GND pins:
 - **Auto-saves after each recording** in REC mode
 - **Auto-saves when tracks are cleared**
 - **Auto-loads last session** on startup
-- Saves to: `~/looper_autosave/session.json`
+- **Dual session files**:
+  - Normal mode: `~/looper_autosave/session.json`
+  - Super Looper mode: `~/looper_autosave/supersession.json`
 - Survives power cycles!
+
+### CLI Commands
+Access via SSH to control advanced features:
+
+```bash
+# Super Looper Mode
+SL ON              # Enable Super Looper with fixed duration
+SL OFF             # Return to Normal mode
+
+# Track Status
+status             # Show all tracks, durations, and mode
+
+# MIDI Export
+save               # Export tracks (merged or separate)
+
+# MIDI Import
+load <track> <file.mid>   # Load MIDI file into track
+```
 
 ### MIDI Export
 Export your compositions via SSH:
 
 ```bash
-# Type 'save' in the terminal
 save
 
 # Choose option:
@@ -198,11 +219,18 @@ Check which tracks have recordings:
 ```bash
 status
 
-# Output example:
+# Normal mode output:
+# Mode: Normal
 # Track 1: 245 events, 8.32s
 # Track 2: Empty
 # Track 3: 189 events, 5.47s
-# Max duration: 8.32s
+# Longest track: 8.32s
+
+# Super Looper mode output:
+# Mode: 🔒 SUPER LOOPER (Fixed Duration: 8.50s)
+# Track 1: 245 events, 8.50s (forced to SL duration)
+# Track 2: 189 events, 8.50s (forced to SL duration)
+# All tracks loop to: 8.50s
 ```
 
 ---
@@ -321,6 +349,247 @@ ls                                    # List files
 cd looper_exports                     # Change directory
 exit                                  # Quit
 ```
+
+---
+
+## 🔒 Super Looper Mode
+
+**Super Looper Mode** ensures perfect synchronization across all tracks by enforcing a fixed loop duration. Unlike normal mode where tracks loop at different lengths, Super Looper guarantees all tracks align to the same timeline.
+
+### Key Features
+
+- **Fixed Duration Enforcement** - All tracks loop to the exact same duration
+- **Perfect Synchronization** - No drift or timing misalignment between tracks
+- **Separate Session Management** - Independent save files for Super Looper and Normal modes
+- **Auto-Stop Recording** - Recordings automatically stop at the set duration limit
+- **Two Setup Methods**:
+  - **Manual Declaration**: Set a specific duration before recording (e.g., 8 seconds)
+  - **First Track Duration**: Use the first recorded track's length as the fixed duration
+
+### Activating Super Looper Mode
+
+Via the CLI (SSH into your Pi):
+
+```bash
+# Enable Super Looper
+SL ON
+
+# You'll be prompted to choose setup method:
+# 1. Declare time manually - Enter duration in seconds
+# 2. Get time from first recorded track - Duration set automatically
+```
+
+Example session:
+```bash
+SL ON
+
+=== Super Looper Duration Setup ===
+1. Declare time manually
+2. Get time from first recorded track
+Choose option (1/2): 1
+Enter duration in seconds: 8.5
+✓ Super Looper enabled with 8.50s fixed duration
+```
+
+### Using Super Looper Mode
+
+1. **Manual Duration Setup**:
+   - Type `SL ON`
+   - Choose option `1`
+   - Enter duration (e.g., `8` for 8 seconds)
+   - All tracks will now loop to exactly 8 seconds
+   - Recordings auto-stop at 8 seconds
+
+2. **First Track Duration**:
+   - Type `SL ON`
+   - Choose option `2`
+   - Record your first track normally
+   - When you press Stop, that duration becomes the fixed length
+   - All subsequent tracks loop to this duration
+
+### Recording Behavior
+
+**Shorter than Fixed Duration**:
+```
+Fixed duration: 8.00s
+Recorded:       5.50s
+Result:         Track loops twice (2.5 loops per cycle) to fill 8.00s
+```
+
+**Exceeds Fixed Duration**:
+```
+Fixed duration: 8.00s
+Recorded:       9.20s
+Result:         Track cut at 8.00s, ⚠️ warning displayed
+```
+
+### Deactivating Super Looper Mode
+
+```bash
+# Return to Normal mode
+SL OFF
+
+# Your Super Looper session is saved
+# Normal mode session is restored
+```
+
+### Session Management
+
+Super Looper uses **separate session files**:
+
+- **Super Looper**: `~/looper_autosave/supersession.json`
+- **Normal Mode**: `~/looper_autosave/session.json`
+
+Switching modes:
+1. Current session is auto-saved
+2. Mode switches to new mode
+3. Previous session in that mode is loaded
+4. All tracks and settings are preserved independently
+
+### Checking Status
+
+```bash
+status
+
+# Output in Super Looper mode:
+# Mode: 🔒 SUPER LOOPER (Fixed Duration: 8.50s)
+# Track 1: 245 events, 8.50s (forced to SL duration)
+# Track 2: 189 events, 8.50s (forced to SL duration)
+# All tracks loop to: 8.50s
+```
+
+### When to Use Super Looper
+
+✅ **Best for:**
+- Drum patterns and rhythmic loops
+- EDM/electronic music production
+- Perfectly timed backing tracks
+- Songs requiring strict timekeeping
+
+❌ **Not ideal for:**
+- Free-form improvisation
+- Varying phrase lengths
+- Classical/jazz with rubato
+
+---
+
+## 🎼 Multitrack Usage Guide
+
+### Understanding Track Channels
+
+Each track uses its **own dedicated MIDI channel** (0-9) for tone isolation:
+- **Track 1** → Channel 0
+- **Track 2** → Channel 1
+- ...
+- **Track 10** → Channel 9
+
+This means every track can have a **different tone/instrument** simultaneously!
+
+### Recording Multiple Tracks with Different Tones
+
+**Workflow:**
+1. Select tone on your Casio keyboard **before** recording
+2. Press **Button 2** to start recording
+3. The tone is automatically captured and saved with the track
+4. Navigate to next track (Button 4)
+5. Change tone on keyboard
+6. Record next track with new tone
+
+**Example:**
+```
+Track 1: Select "Grand Piano" → Record melody
+Track 2: Select "Strings" → Record harmony
+Track 3: Select "Bass" → Record bass line
+Track 4: Select "Drums" → Record percussion
+```
+
+### Backing Track Recording
+
+When recording a new track, **all previously recorded tracks play in the background**:
+
+- Hear the complete mix while adding new parts
+- Perfect for layering complementary melodies
+- No need for external metronome if you have a rhythm track
+
+**Example:**
+```
+1. Record drums on Track 1
+2. Select Track 2 → drums play as backing track
+3. Record bass while hearing drums
+4. Select Track 3 → drums + bass play as backing tracks
+5. Record melody with full rhythm section
+```
+
+### Looping Behavior
+
+**Normal Mode:**
+- Each track loops at its **own recorded duration**
+- Shorter tracks loop multiple times per cycle
+- Example: 4s track + 8s track → 4s track plays twice
+
+**Super Looper Mode:**
+- All tracks loop to the **same fixed duration**
+- Ensures perfect synchronization
+- Example: All tracks loop to exactly 8.00s
+
+### Tone Independence
+
+Your recordings store **MIDI data only**, not audio:
+
+- Change tone on keyboard **anytime** during playback
+- All tracks respond to new tone selection
+- Example: Record in Piano, play back as Strings
+
+**Per-Track Tones (Advanced):**
+The system remembers each track's original tone:
+- Track 1: Piano (Program 0)
+- Track 2: Strings (Program 48)
+- Each plays with its recorded tone during multitrack playback
+
+### Track Management
+
+**Clearing Individual Tracks:**
+```
+1. Switch to PLAY mode (Button 1)
+2. Start playback (Button 2)
+3. Navigate to track to clear (Button 3/4)
+4. Press Button 4 (Clear) - WHITE LED flashes
+5. Track immediately goes silent
+```
+
+**Clearing All Tracks:**
+```
+Touch the touch sensor
+→ RED LED flashes for 1 second
+→ All 10 tracks deleted
+→ ⚠️ No undo!
+```
+
+### MIDI Export Options
+
+**Merged Export** (Single file):
+```bash
+save
+Choose: 1
+# Creates: merged_output.mid (all tracks combined)
+# Use in: DAW software, MIDI players
+```
+
+**Separate Export** (Individual files):
+```bash
+save
+Choose: 2
+# Creates: track_1.mid, track_2.mid, ..., track_10.mid
+# Use in: DAW for individual editing/mixing
+```
+
+### Practical Multitrack Tips
+
+1. **Start with rhythm**: Record drums/percussion on Track 1 first
+2. **Layer bass next**: Track 2 provides harmonic foundation
+3. **Add harmonies**: Tracks 3-6 for chords and melodies
+4. **Use Track 10 for leads**: Easy to clear/re-record solos
+5. **Name your tracks** (in DAW after export for reference)
 
 ---
 
