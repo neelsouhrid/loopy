@@ -18,6 +18,9 @@ A hardware-based 10-track MIDI looper pedal built with Raspberry Pi 3B+ and desi
 
 ---
 
+**Here is a quick video**
+https://github.com/user-attachments/assets/2e4bd62a-28d7-422f-b661-94d50daeed41
+
 ## 🛠️ Hardware Requirements
 
 ### Components
