@@ -2,7 +2,6 @@ import mido
 import time
 import threading
 import RPi.GPIO as GPIO
-import os
 import json
 from pathlib import Path
 from datetime import datetime
@@ -34,6 +33,14 @@ tracks = [[] for _ in range(10)]
 track_durations = [0.0 for _ in range(10)]  # Store actual recorded duration
 track_programs = [0 for _ in range(10)]  # Store program/tone for each track
 track_channels = [0 for _ in range(10)]  # Store MIDI channel for each track
+track_bank_msb = [0 for _ in range(10)]  # Bank Select MSB (CC 0) for 600 tones
+track_bank_lsb = [0 for _ in range(10)]  # Bank Select LSB (CC 32) for 600 tones
+
+# CRITICAL: Assign each track to its own MIDI channel for tone isolation
+# Track 1 -> Channel 0, Track 2 -> Channel 1, etc.
+for i in range(10):
+    track_channels[i] = i  # Tracks use channels 0-9
+
 current_track_idx = 0
 system_mode = MODE_REC
 
@@ -43,7 +50,9 @@ is_recording = False
 start_time = 0.0
 pause_start_time = 0.0
 total_pause_duration = 0.0
-recording_start_time = 0.0  # Track when recording actually started
+
+# Track the last program change received (for pre-recording tone setting)
+last_program_change = None  # Will store (program, channel) tuple
 
 midi_in = None
 midi_out = None
@@ -162,7 +171,9 @@ def autosave_tracks():
             'tracks': [],
             'durations': track_durations,
             'programs': track_programs,  # Save tone settings
-            'channels': track_channels   # Save channel settings
+            'channels': track_channels,   # Save channel settings
+            'bank_msb': track_bank_msb,   # Save bank MSB
+            'bank_lsb': track_bank_lsb    # Save bank LSB
         }
         
         for track in tracks:
@@ -201,6 +212,7 @@ def autosave_tracks():
 def autoload_tracks():
     """Load last session from autosave"""
     global tracks, track_durations, track_programs, track_channels
+    global track_bank_msb, track_bank_lsb
     
     try:
         save_file = AUTOSAVE_DIR / 'session.json'
@@ -222,7 +234,13 @@ def autoload_tracks():
         if 'programs' in data:
             track_programs[:] = data['programs']
         if 'channels' in data:
-            track_channels[:] = data['channels']
+            # Override with per-track channels (0-9)
+            for i in range(10):
+                track_channels[i] = i
+        if 'bank_msb' in data:
+            track_bank_msb[:] = data['bank_msb']
+        if 'bank_lsb' in data:
+            track_bank_lsb[:] = data['bank_lsb']
         
         for i, track_data in enumerate(data['tracks']):
             tracks[i] = []
@@ -272,15 +290,22 @@ def autoload_tracks():
         print(f"Autoload error: {e}")
 
 def export_midi_merged(filename=None):
-    """Export all tracks merged into one MIDI file with timestamp"""
+    """Export all tracks merged into one MIDI file with timestamp - FIXED TIMING"""
     try:
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"merged_{timestamp}.mid"
         
-        mid = mido.MidiFile(ticks_per_beat=480)
+        # Using standard MIDI parameters
+        ticks_per_beat = 480
+        tempo = 500000  # 120 BPM in microseconds
+        
+        mid = mido.MidiFile(ticks_per_beat=ticks_per_beat)
         track = mido.MidiTrack()
         mid.tracks.append(track)
+        
+        # Add tempo message at start
+        track.append(mido.MetaMessage('set_tempo', tempo=tempo, time=0))
         
         # Collect all events
         all_events = []
@@ -291,11 +316,14 @@ def export_midi_merged(filename=None):
         # Sort by time
         all_events.sort(key=lambda x: x[0])
         
-        # Convert to MIDI with delta times
+        # Convert seconds to MIDI ticks using tempo
+        # Formula: ticks = seconds / (tempo_microseconds / 1000000) * ticks_per_beat
+        seconds_per_tick = (tempo / 1000000.0) / ticks_per_beat
+        
         prev_time = 0
         for timestamp, msg in all_events:
             delta_time = timestamp - prev_time
-            delta_ticks = int(delta_time * 480)
+            delta_ticks = int(delta_time / seconds_per_tick)
             msg_copy = msg.copy(time=delta_ticks)
             track.append(msg_copy)
             prev_time = timestamp
@@ -309,23 +337,31 @@ def export_midi_merged(filename=None):
         return None
 
 def export_midi_separate():
-    """Export each track as separate MIDI file with timestamp"""
+    """Export each track as separate MIDI file with timestamp - FIXED TIMING"""
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         exported = []
+        
+        # Using standard MIDI parameters
+        ticks_per_beat = 480
+        tempo = 500000  # 120 BPM
+        seconds_per_tick = (tempo / 1000000.0) / ticks_per_beat
         
         for i, track_data in enumerate(tracks):
             if len(track_data) == 0:
                 continue
             
-            mid = mido.MidiFile(ticks_per_beat=480)
+            mid = mido.MidiFile(ticks_per_beat=ticks_per_beat)
             track = mido.MidiTrack()
             mid.tracks.append(track)
+            
+            # Add tempo
+            track.append(mido.MetaMessage('set_tempo', tempo=tempo, time=0))
             
             prev_time = 0
             for ts, msg in track_data:
                 delta_time = ts - prev_time
-                delta_ticks = int(delta_time * 480)
+                delta_ticks = int(delta_time / seconds_per_tick)
                 msg_copy = msg.copy(time=delta_ticks)
                 track.append(msg_copy)
                 prev_time = ts
@@ -407,14 +443,40 @@ def sequencer_thread():
     print(f"Master loop duration: {loop_duration:.2f}s")
     
     # Send initial program changes to set tones for each track
+    print("\n🎼 Setting up track tones...")
     for i in range(10):
-        if len(tracks[i]) > 0 and track_programs[i] > 0:
+        if len(tracks[i]) > 0:
+            channel = track_channels[i]  # Use track's dedicated channel
+            
+            # Reset pedal/sustain for this channel
             try:
-                prog_msg = mido.Message('program_change', program=track_programs[i], channel=track_channels[i])
-                midi_out.send(prog_msg)
-                print(f"Set Track {i+1} tone: Program {track_programs[i]} on channel {track_channels[i]}")
-            except Exception as e:
-                print(f"Error setting tone: {e}")
+                midi_out.send(mido.Message('control_change', control=64, value=0, channel=channel))
+            except:
+                pass
+            
+            if track_programs[i] > 0 or track_bank_msb[i] > 0 or track_bank_lsb[i] > 0:
+                try:
+                    # Send Bank Select if available (for 600 tones)
+                    if track_bank_msb[i] > 0 or track_bank_lsb[i] > 0:
+                        # Bank Select MSB (CC 0)
+                        midi_out.send(mido.Message('control_change', control=0, value=track_bank_msb[i], channel=channel))
+                        # Bank Select LSB (CC 32)
+                        midi_out.send(mido.Message('control_change', control=32, value=track_bank_lsb[i], channel=channel))
+                        print(f"🎵 Track {i+1} (Ch {channel}): Bank {track_bank_msb[i]}:{track_bank_lsb[i]}, Program {track_programs[i]}")
+                    
+                    # Send Program Change
+                    prog_msg = mido.Message('program_change', program=track_programs[i], channel=channel)
+                    midi_out.send(prog_msg)
+                    
+                    if track_bank_msb[i] == 0 and track_bank_lsb[i] == 0:
+                        print(f"🎵 Track {i+1} (Ch {channel}): Program {track_programs[i]}")
+                    
+                    time.sleep(0.01)  # Small delay between program changes
+                except Exception as e:
+                    print(f"❌ Error setting tone for Track {i+1}: {e}")
+            else:
+                print(f"ℹ️  Track {i+1} (Ch {channel}): No tone set (will use default)")
+    print()
     
     # Build playlists for each track
     track_playlists = []
@@ -479,7 +541,7 @@ def sequencer_thread():
                         midi_out.send(msg)
                         # Debug program changes
                         if msg.type == 'program_change':
-                            print(f"Sent program change: {msg.program} on channel {msg.channel}")
+                            print(f"🎵 PLAYBACK: Sent Program Change {msg.program} on Channel {msg.channel} (Track {track_idx + 1})")
                     except Exception as e:
                         print(f"MIDI send error: {e}")
                     event_indices[track_idx] += 1
@@ -493,30 +555,65 @@ def sequencer_thread():
     print("Sequencer Stopped")
 
 def midi_recorder():
-    """Record MIDI input - ALL message types including program changes"""
-    global recording_start_time
+    """Record MIDI input - ALL message types, remap to track's channel"""
+    global last_program_change
     
     print(f"Listening on {midi_in.name}...")
+    print("🎵 Waiting for MIDI input (including Program Changes for tone)...")
     
     for msg in midi_in:
-        # Only record when actively recording (no passthrough to avoid double notes)
+        # Track ALL program changes and bank selects (even when not recording)
+        if msg.type == 'program_change':
+            last_program_change = (msg.program, msg.channel)
+            print(f"🎹 INCOMING Program Change: Program #{msg.program} on Channel {msg.channel}")
+            print(f"   (Will be used for next recording)")
+        
+        # Track bank select messages for 600-tone support
+        if msg.type == 'control_change':
+            if msg.control == 0:  # Bank Select MSB
+                print(f"🏦 INCOMING Bank Select MSB: {msg.value} on Channel {msg.channel}")
+            elif msg.control == 32:  # Bank Select LSB
+                print(f"🏦 INCOMING Bank Select LSB: {msg.value} on Channel {msg.channel}")
+            elif msg.control == 64:  # Sustain pedal
+                pedal_state = "ON" if msg.value >= 64 else "OFF"
+                print(f"🦶 Sustain Pedal: {pedal_state} (value={msg.value})")
+        
+        # Only record when actively recording
         if is_running and not is_paused and system_mode == MODE_REC and is_recording:
             now = time.perf_counter()
             rec_time = now - start_time - total_pause_duration
             
             if rec_time >= 0:
-                tracks[current_track_idx].append((rec_time, msg))
+                # CRITICAL: Remap message to track's dedicated channel
+                track_channel = track_channels[current_track_idx]
                 
-                # Track program changes for tone preservation
+                if hasattr(msg, 'channel'):
+                    # Create new message with track's channel
+                    msg_remapped = msg.copy(channel=track_channel)
+                else:
+                    msg_remapped = msg
+                
+                tracks[current_track_idx].append((rec_time, msg_remapped))
+                
+                # Track program changes
                 if msg.type == 'program_change':
                     track_programs[current_track_idx] = msg.program
-                    track_channels[current_track_idx] = msg.channel
-                    print(f"✓ Recorded program change: Program #{msg.program} (Tone) on channel {msg.channel}")
+                    print(f"✅ RECORDED Program Change: Program #{msg.program} → Track {current_track_idx + 1} (Ch {track_channel})")
+                
+                # Track bank selects
+                if msg.type == 'control_change':
+                    if msg.control == 0:  # Bank MSB
+                        track_bank_msb[current_track_idx] = msg.value
+                        print(f"✅ RECORDED Bank MSB: {msg.value} → Track {current_track_idx + 1}")
+                    elif msg.control == 32:  # Bank LSB
+                        track_bank_lsb[current_track_idx] = msg.value
+                        print(f"✅ RECORDED Bank LSB: {msg.value} → Track {current_track_idx + 1}")
 
 # --- BUTTON LOGIC ---
 def handle_buttons():
     global system_mode, current_track_idx, is_running, is_paused, is_recording
-    global start_time, total_pause_duration, tracks, track_durations, recording_start_time
+    global start_time, total_pause_duration, tracks, track_durations
+    global last_program_change
     
     last_states = {
         BTN_MODE: 1,
@@ -569,8 +666,21 @@ def handle_buttons():
                     if system_mode == MODE_REC:
                         tracks[current_track_idx] = []
                         track_durations[current_track_idx] = 0.0
+                        
+                        # Inject last program change at the start if available
+                        if last_program_change is not None:
+                            program, _ = last_program_change  # Ignore input channel
+                            track_channel = track_channels[current_track_idx]  # Use track's channel
+                            track_programs[current_track_idx] = program
+                            
+                            # Create program change message with track's channel
+                            prog_msg = mido.Message('program_change', program=program, channel=track_channel)
+                            tracks[current_track_idx].append((0.0, prog_msg))
+                            
+                            print(f"📌 Using pre-recording tone: Program {program}")
+                            print(f"   ✅ Injected at start of Track {current_track_idx + 1} (Channel {track_channel})")
+                        
                         is_recording = True
-                        recording_start_time = time.perf_counter()
                         print(f"Recording Track {current_track_idx + 1}...")
                     else:
                         print("Playing...")
