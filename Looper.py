@@ -24,6 +24,8 @@ TRACK_LEDS = [4, 17, 27, 25, 12, 16, 2, 3, 8, 7]
 # Storage paths
 AUTOSAVE_DIR = Path.home() / "looper_autosave"
 MIDI_EXPORT_DIR = Path.home() / "looper_exports"
+SUPERSESSION_FILE = AUTOSAVE_DIR / "supersession.json"
+NORMAL_SESSION_FILE = AUTOSAVE_DIR / "session.json"
 
 # --- STATE ---
 MODE_REC = "REC"
@@ -50,6 +52,11 @@ is_recording = False
 start_time = 0.0
 pause_start_time = 0.0
 total_pause_duration = 0.0
+
+# Super Looper Mode
+super_looper_enabled = False
+super_looper_duration = 0.0  # Fixed duration for all tracks in seconds
+super_looper_duration_set = False  # Whether duration has been configured
 
 # Track the last program change received (for pre-recording tone setting)
 last_program_change = None  # Will store (program, channel) tuple
@@ -92,7 +99,9 @@ def get_track_duration(track_idx):
     return track_durations[track_idx]
 
 def get_max_track_duration():
-    """Get the duration of the longest track"""
+    """Get the duration of the longest track (or Super Looper duration if enabled)"""
+    if super_looper_enabled and super_looper_duration_set:
+        return super_looper_duration
     return max(track_durations)
 
 def update_ui():
@@ -165,7 +174,9 @@ def ensure_directories():
     MIDI_EXPORT_DIR.mkdir(exist_ok=True)
 
 def autosave_tracks():
-    """Auto-save current session as JSON"""
+    """Auto-save current session as JSON to appropriate file"""
+    global super_looper_enabled, super_looper_duration, super_looper_duration_set
+    
     try:
         data = {
             'tracks': [],
@@ -173,7 +184,10 @@ def autosave_tracks():
             'programs': track_programs,  # Save tone settings
             'channels': track_channels,   # Save channel settings
             'bank_msb': track_bank_msb,   # Save bank MSB
-            'bank_lsb': track_bank_lsb    # Save bank LSB
+            'bank_lsb': track_bank_lsb,   # Save bank LSB
+            'super_looper_enabled': super_looper_enabled,
+            'super_looper_duration': super_looper_duration,
+            'super_looper_duration_set': super_looper_duration_set
         }
         
         for track in tracks:
@@ -202,10 +216,13 @@ def autosave_tracks():
                 track_data.append(msg_dict)
             data['tracks'].append(track_data)
         
-        with open(AUTOSAVE_DIR / 'session.json', 'w') as f:
+        # Save to appropriate file based on mode
+        save_file = SUPERSESSION_FILE if super_looper_enabled else NORMAL_SESSION_FILE
+        with open(save_file, 'w') as f:
             json.dump(data, f)
         
-        print("✓ Auto-saved")
+        mode_str = "Super Looper" if super_looper_enabled else "Normal"
+        print(f"✓ Auto-saved ({mode_str})")
     except Exception as e:
         print(f"Autosave error: {e}")
 
@@ -213,11 +230,15 @@ def autoload_tracks():
     """Load last session from autosave"""
     global tracks, track_durations, track_programs, track_channels
     global track_bank_msb, track_bank_lsb
+    global super_looper_enabled, super_looper_duration, super_looper_duration_set
     
     try:
-        save_file = AUTOSAVE_DIR / 'session.json'
+        # Load from appropriate file based on current mode
+        save_file = SUPERSESSION_FILE if super_looper_enabled else NORMAL_SESSION_FILE
+        
         if not save_file.exists():
-            print("No autosave found")
+            mode_str = "Super Looper" if super_looper_enabled else "Normal"
+            print(f"No {mode_str} autosave found")
             return
         
         with open(save_file, 'r') as f:
@@ -241,6 +262,14 @@ def autoload_tracks():
             track_bank_msb[:] = data['bank_msb']
         if 'bank_lsb' in data:
             track_bank_lsb[:] = data['bank_lsb']
+        
+        # Restore Super Looper settings
+        if 'super_looper_enabled' in data:
+            super_looper_enabled = data['super_looper_enabled']
+        if 'super_looper_duration' in data:
+            super_looper_duration = data['super_looper_duration']
+        if 'super_looper_duration_set' in data:
+            super_looper_duration_set = data['super_looper_duration_set']
         
         for i, track_data in enumerate(data['tracks']):
             tracks[i] = []
@@ -289,11 +318,102 @@ def autoload_tracks():
     except Exception as e:
         print(f"Autoload error: {e}")
 
+def setup_super_looper_duration():
+    """Interactive setup for Super Looper duration"""
+    global super_looper_duration, super_looper_duration_set
+    
+    print("\n=== Super Looper Duration Setup ===")
+    print("1. Declare time manually")
+    print("2. Get time from first recorded track")
+    
+    try:
+        choice = input("Choose option (1/2): ").strip()
+        
+        if choice == '1':
+            duration_str = input("Enter duration in seconds: ").strip()
+            duration = float(duration_str)
+            if duration <= 0:
+                print("❌ Duration must be positive!")
+                return False
+            super_looper_duration = duration
+            super_looper_duration_set = True
+            print(f"✓ Super Looper enabled with {duration:.2f}s fixed duration")
+            return True
+        
+        elif choice == '2':
+            super_looper_duration_set = False
+            super_looper_duration = 0.0
+            print("✓ Super Looper enabled - duration will be set from first recorded track")
+            return True
+        
+        else:
+            print("❌ Invalid choice")
+            return False
+    
+    except ValueError:
+        print("❌ Invalid number")
+        return False
+    except KeyboardInterrupt:
+        print("\n❌ Cancelled")
+        return False
+
+def switch_to_super_looper():
+    """Switch from Normal mode to Super Looper mode"""
+    global super_looper_enabled
+    
+    if super_looper_enabled:
+        print("⚠️  Already in Super Looper mode!")
+        return
+    
+    # Save current normal session
+    print("💾 Saving Normal session...  ")
+    autosave_tracks()
+    
+    # Switch to Super Looper mode
+    super_looper_enabled = True
+    
+    # Load Super Looper session
+    print("📂 Loading Super Looper session...")
+    autoload_tracks()
+    
+    # Setup duration if not already configured
+    if not super_looper_duration_set and super_looper_duration == 0:
+        if not setup_super_looper_duration():
+            # Failed setup, revert
+            super_looper_enabled = False
+            autoload_tracks()
+            return
+    else:
+        print(f"✓ Super Looper mode active (Duration: {super_looper_duration:.2f}s)")
+    
+    autosave_tracks()
+
+def switch_to_normal_mode():
+    """Switch from Super Looper mode to Normal mode"""
+    global super_looper_enabled
+    
+    if not super_looper_enabled:
+        print("⚠️  Already in Normal mode!")
+        return
+    
+    # Save current Super Looper session
+    print("💾 Saving Super Looper session...")
+    autosave_tracks()
+    
+    # Switch to Normal mode
+    super_looper_enabled = False
+    
+    # Load Normal session
+    print("📂 Loading Normal session...")
+    autoload_tracks()
+    
+    print("✓ Switched to Normal Mode")
+    autosave_tracks()
+
 def export_midi_merged(filename=None):
     """Export all tracks merged into one MIDI file with timestamp - FIXED TIMING"""
     try:
         if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"merged_{timestamp}.mid"
         
         # Using standard MIDI parameters
@@ -576,7 +696,6 @@ def midi_recorder():
                 print(f"🏦 INCOMING Bank Select LSB: {msg.value} on Channel {msg.channel}")
             elif msg.control == 64:  # Sustain pedal
                 pedal_state = "ON" if msg.value >= 64 else "OFF"
-                print(f"🦶 Sustain Pedal: {pedal_state} (value={msg.value})")
         
         # Only record when actively recording
         if is_running and not is_paused and system_mode == MODE_REC and is_recording:
@@ -614,6 +733,7 @@ def handle_buttons():
     global system_mode, current_track_idx, is_running, is_paused, is_recording
     global start_time, total_pause_duration, tracks, track_durations
     global last_program_change
+    global super_looper_enabled, super_looper_duration, super_looper_duration_set
     
     last_states = {
         BTN_MODE: 1,
@@ -649,8 +769,30 @@ def handle_buttons():
                     # If we were recording, set the actual duration
                     if is_recording:
                         actual_duration = stop_time - start_time - total_pause_duration
-                        track_durations[current_track_idx] = actual_duration
-                        print(f"Recorded {actual_duration:.2f}s on Track {current_track_idx + 1}")
+                        
+                        # Super Looper duration enforcement
+                        if super_looper_enabled:
+                            # If this is the first track in "from first track" mode, set the duration
+                            if not super_looper_duration_set:
+                                super_looper_duration = actual_duration
+                                super_looper_duration_set = True
+                                print(f"✓ Super Looper duration set to {actual_duration:.2f}s from Track {current_track_idx + 1}")
+                            
+                            # Force track duration to Super Looper duration
+                            track_durations[current_track_idx] = super_looper_duration
+                            
+                            if actual_duration < super_looper_duration:
+                                print(f"Recorded {actual_duration:.2f}s on Track {current_track_idx + 1}")
+                                print(f"  Track will loop to fill {super_looper_duration:.2f}s")
+                            elif actual_duration > super_looper_duration:
+                                print(f"Recorded {actual_duration:.2f}s on Track {current_track_idx + 1}")
+                                print(f"  ⚠️  Exceeded Super Looper duration by {actual_duration - super_looper_duration:.2f}s")
+                            else:
+                                print(f"Recorded {actual_duration:.2f}s on Track {current_track_idx + 1} (perfect fit!)")
+                        else:
+                            # Normal mode
+                            track_durations[current_track_idx] = actual_duration
+                            print(f"Recorded {actual_duration:.2f}s on Track {current_track_idx + 1}")
                     
                     is_running = False
                     is_paused = False
@@ -681,7 +823,10 @@ def handle_buttons():
                             print(f"   ✅ Injected at start of Track {current_track_idx + 1} (Channel {track_channel})")
                         
                         is_recording = True
-                        print(f"Recording Track {current_track_idx + 1}...")
+                        if super_looper_enabled and super_looper_duration_set:
+                            print(f"Recording Track {current_track_idx + 1} (Max: {super_looper_duration:.2f}s)...")
+                        else:
+                            print(f"Recording Track {current_track_idx + 1}...")
                     else:
                         print("Playing...")
                     
@@ -730,10 +875,27 @@ def handle_buttons():
                     tracks[i] = []
                     track_durations[i] = 0.0
                     track_programs[i] = 0
-                    track_channels[i] = 0
-                flash_led(LED_DELETE_ALL, duration=1.0)
-                print("--- ALL TRACKS DELETED ---")
-                autosave_tracks()
+                    track_channels[i] = i  # Reset to default channel
+                    track_bank_msb[i] = 0
+                    track_bank_lsb[i] = 0
+                
+                # Reset Super Looper duration if in Super Looper mode
+                if super_looper_enabled:
+                    super_looper_duration = 0.0
+                    super_looper_duration_set = False
+                    flash_led(LED_DELETE_ALL, duration=1.0)
+                    print("--- ALL TRACKS DELETED ---")
+                    print("🔓 Super Looper duration reset")
+                    autosave_tracks()
+                    
+                    # Immediately prompt for new duration setup
+                    setup_super_looper_duration()
+                    autosave_tracks()
+                else:
+                    flash_led(LED_DELETE_ALL, duration=1.0)
+                    print("--- ALL TRACKS DELETED ---")
+                    autosave_tracks()
+                
                 update_ui()
             
             last_states[BTN_MODE] = s_mode
@@ -754,6 +916,8 @@ def cli_thread():
     print("save - Export MIDI files")
     print("load <track> <file.mid> - Import MIDI to track")
     print("status - Show track info")
+    print("SL ON - Enable Super Looper mode")
+    print("SL OFF - Disable Super Looper mode")
     print("==============================\n")
     
     while True:
@@ -786,15 +950,35 @@ def cli_thread():
             
             elif cmd == 'status':
                 print("\n=== Track Status ===")
+                if super_looper_enabled:
+                    if super_looper_duration_set:
+                        print(f"Mode: 🔒 SUPER LOOPER (Fixed Duration: {super_looper_duration:.2f}s)")
+                    else:
+                        print(f"Mode: 🔒 SUPER LOOPER (Duration from first track)")
+                else:
+                    print("Mode: Normal")
+                print()
                 for i, track in enumerate(tracks):
                     if len(track) > 0:
                         duration = track_durations[i]
-                        print(f"Track {i+1}: {len(track)} events, {duration:.2f}s")
+                        forced = " (forced to SL duration)" if super_looper_enabled and super_looper_duration_set else ""
+                        print(f"Track {i+1}: {len(track)} events, {duration:.2f}s{forced}")
                     else:
                         print(f"Track {i+1}: Empty")
-                max_dur = get_max_track_duration()
-                print(f"Longest track: {max_dur:.2f}s")
+                if super_looper_enabled and super_looper_duration_set:
+                    print(f"\nAll tracks loop to: {super_looper_duration:.2f}s")
+                else:
+                    max_dur = get_max_track_duration()
+                    print(f"Longest track: {max_dur:.2f}s")
                 print("====================\n")
+            
+            elif cmd.lower() == 'sl on':
+                switch_to_super_looper()
+                update_ui()
+            
+            elif cmd.lower() == 'sl off':
+                switch_to_normal_mode()
+                update_ui()
             
         except Exception as e:
             print(f"Error: {e}")
